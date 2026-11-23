@@ -24,7 +24,11 @@ from .const import (
     ATTR_HOME_ID,
     ATTR_HOME_NAME,
     ATTR_IS_CALIBRATING,
+    CONF_CONTROL_MODE,
+    DEFAULT_CONTROL_MODE,
     DOMAIN,
+    MODE_CLOUD_ONLY,
+    MODE_LOCAL_ONLY,
     MOVE_FOLLOW_UP_SECONDS,
     MOVE_TIMEOUT_SECONDS,
 )
@@ -101,16 +105,49 @@ class UdiconnectCover(UdiconnectEntity, CoverEntity):
         self._unsub_follow_up: CALLBACK_TYPE | None = None
 
     @property
-    def available(self) -> bool:
-        """Return True if the device is online."""
+    def _control_mode(self) -> str:
+        return self.coordinator.config_entry.options.get(
+            CONF_CONTROL_MODE, DEFAULT_CONTROL_MODE
+        )
+
+    def _local_mac(self) -> str | None:
+        """MAC to use on the LAN, or None in cloud-only mode."""
         device = self.device
-        return super().available and device is not None and device.is_online
+        if device is None or self._control_mode == MODE_CLOUD_ONLY:
+            return None
+        return device.mac_address
+
+    def _local_reachable(self) -> bool:
+        mac = self._local_mac()
+        return mac is not None and self.coordinator.local_manager.is_reachable(mac)
+
+    @property
+    def available(self) -> bool:
+        """Return True if the device answers on the LAN or the cloud says online.
+
+        Home Assistant skips service calls to unavailable entities, so tying
+        this to the cloud alone would block local control exactly when the
+        cloud fails.
+        """
+        device = self.device
+        if device is None:
+            return False
+        if self._local_reachable():
+            return True
+        return super().available and device.is_online
 
     @property
     def current_cover_position(self) -> int | None:
         """Return the current position (0 closed, 100 open)."""
         device = self.device
-        return device.position if device else None
+        if device is None:
+            return None
+        mac = self._local_mac()
+        if mac is not None:
+            local = self.coordinator.local_manager.position(mac)
+            if local is not None:
+                return local
+        return device.position
 
     @property
     def is_closed(self) -> bool | None:
@@ -164,30 +201,80 @@ class UdiconnectCover(UdiconnectEntity, CoverEntity):
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Stop the cover."""
-        try:
-            await self.coordinator.client.async_stop(self._cloud_device_id())
-        except UdiconnectError as err:
-            raise self._command_error("stop_failed", err) from err
-
+        sent_locally = await self._async_command("stop")
         self._stop_tracking()
         self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
+        if not sent_locally:
+            # Over the LAN the module broadcasts where it stopped by itself.
+            await self.coordinator.async_request_refresh()
 
     async def _async_set_position(self, position: int) -> None:
-        try:
-            await self.coordinator.client.async_set_position(
-                self._cloud_device_id(), position
-            )
-        except UdiconnectError as err:
-            raise self._command_error("set_position_failed", err) from err
+        sent_locally = await self._async_command("move", position)
 
         # The cloud keeps reporting the old position until the motor arrives,
-        # so poll faster until then and show opening/closing in the meantime.
+        # so show opening/closing meanwhile. Over the LAN the module
+        # broadcasts its position on arrival.
         self._target_position = position
         self._move_started_at = time.monotonic()
         self.async_write_ha_state()
         self._schedule_follow_up()
-        await self.coordinator.async_request_refresh()
+        if not sent_locally:
+            await self.coordinator.async_request_refresh()
+
+    async def _async_command(self, kind: str, position: int = 0) -> bool:
+        """Send stop or move per the control mode. True if it went over the LAN.
+
+        A LAN command counts only when the module acknowledges it, so the
+        cloud fallback runs when the module did not hear it, not merely when
+        the datagram could not be sent. Both commands are absolute (stop, go
+        to N%), so a command that reached the module and is resent through
+        the cloud does no harm.
+        """
+        what = "stop" if kind == "stop" else f"move to {position}%"
+        mac = self._local_mac()
+        if self._control_mode != MODE_CLOUD_ONLY:
+            local = self.coordinator.local_manager
+            if mac is not None:
+                if kind == "stop":
+                    result = await local.async_stop(mac)
+                else:
+                    result = await local.async_set_position(mac, position)
+                if result.confirmed:
+                    _LOGGER.debug(
+                        "%s: %s over the LAN, confirmed in %.1f s (attempt %d)",
+                        self.entity_id,
+                        what,
+                        result.seconds,
+                        result.attempts,
+                    )
+                    return True
+            if self._control_mode == MODE_LOCAL_ONLY:
+                device = self.device
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="local_failed",
+                    translation_placeholders={
+                        "name": device.name if device else self.entity_id
+                    },
+                )
+            _LOGGER.warning(
+                "%s: %s not confirmed over the LAN, sending it through the cloud",
+                self.entity_id,
+                what,
+            )
+
+        try:
+            if kind == "stop":
+                await self.coordinator.client.async_stop(self._cloud_device_id())
+            else:
+                await self.coordinator.client.async_set_position(
+                    self._cloud_device_id(), position
+                )
+        except UdiconnectError as err:
+            key = "stop_failed" if kind == "stop" else "set_position_failed"
+            raise self._command_error(key, err) from err
+        _LOGGER.debug("%s: %s through the cloud, accepted", self.entity_id, what)
+        return False
 
     def _cloud_device_id(self) -> str:
         # The cloud renumbers deviceId, so take it from the latest poll.
@@ -220,7 +307,13 @@ class UdiconnectCover(UdiconnectEntity, CoverEntity):
 
     async def _async_follow_up(self, _now: Any) -> None:
         self._unsub_follow_up = None
-        if self._target_position is not None:
+        if self._target_position is None:
+            return
+        if self._local_reachable():
+            # Arrival comes as a LAN broadcast: only check the timeout here,
+            # without polling the cloud every few seconds.
+            self._handle_coordinator_update()
+        else:
             await self.coordinator.async_request_refresh()
 
     def _stop_tracking(self) -> None:

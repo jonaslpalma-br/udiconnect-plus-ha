@@ -13,8 +13,18 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import UdiconnectAuthError, UdiconnectClient, UdiconnectError, UdiDevice
-from .const import CONF_DEVICE_UUID, DEFAULT_SCAN_INTERVAL, DOMAIN
-from .coordinator import UdiconnectConfigEntry, UdiconnectCoordinator
+from .const import (
+    CONF_CONTROL_MODE,
+    CONF_DEVICE_UUID,
+    DEFAULT_CONTROL_MODE,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+)
+from .coordinator import (
+    UdiconnectConfigEntry,
+    UdiconnectCoordinator,
+    async_remove_device_cache,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,28 +45,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: UdiconnectConfigEntry) -
         entry.data[CONF_DEVICE_UUID],
     )
 
-    try:
-        await client.async_login()
-    except UdiconnectAuthError as err:
-        raise ConfigEntryAuthFailed(
-            translation_domain=DOMAIN, translation_key="invalid_auth"
-        ) from err
-    except UdiconnectError as err:
-        raise ConfigEntryNotReady(
-            translation_domain=DOMAIN,
-            translation_key="cannot_connect",
-            translation_placeholders={"error": str(err)},
-        ) from err
-
     coordinator = UdiconnectCoordinator(
         hass,
         entry,
         client,
         entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
     )
-    await coordinator.async_config_entry_first_refresh()
+    cached = await coordinator.async_load_device_cache()
+
+    try:
+        await client.async_login()
+        await coordinator.async_config_entry_first_refresh()
+    except UdiconnectAuthError as err:
+        # A rejected password is not hidden behind the saved list.
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN, translation_key="invalid_auth"
+        ) from err
+    except (UdiconnectError, ConfigEntryNotReady) as err:
+        if not cached:
+            if isinstance(err, ConfigEntryNotReady):
+                raise
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+                translation_placeholders={"error": str(err)},
+            ) from err
+        # The coordinator keeps polling and logs in again by itself; entities
+        # that only the cloud feeds stay unavailable until it answers.
+        _LOGGER.warning(
+            "Cloud unreachable (%s): starting from the saved list of %d devices, "
+            "with control over the LAN only until the cloud answers",
+            # The first refresh raises a bare ConfigEntryNotReady; the reason
+            # is its cause.
+            err.__cause__ or err,
+            len(cached),
+        )
+        coordinator.data = cached
     _async_migrate_device_ids(hass, entry, coordinator.data)
     entry.runtime_data = coordinator
+    # Registered before starting, so the sockets close even if setup fails later.
+    entry.async_on_unload(coordinator.local_manager.stop)
+    if coordinator.local_enabled:
+        await coordinator.local_manager.async_start()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -123,6 +153,12 @@ async def _async_update_listener(
 ) -> None:
     """Handle options update."""
     coordinator = entry.runtime_data
+    if entry.options.get(CONF_CONTROL_MODE, DEFAULT_CONTROL_MODE) != (
+        coordinator.control_mode
+    ):
+        # The sockets and the saved list depend on the mode: start over.
+        hass.config_entries.async_schedule_reload(entry.entry_id)
+        return
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     if coordinator.update_interval != timedelta(seconds=scan_interval):
         coordinator.update_interval = timedelta(seconds=scan_interval)
@@ -132,6 +168,11 @@ async def _async_update_listener(
 async def async_unload_entry(hass: HomeAssistant, entry: UdiconnectConfigEntry) -> bool:
     """Unload a config entry."""
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: UdiconnectConfigEntry) -> None:
+    """Delete the saved device list when the entry is removed."""
+    await async_remove_device_cache(hass, entry.entry_id)
 
 
 async def async_remove_config_entry_device(
